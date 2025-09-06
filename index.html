@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D 카플라 블럭 - 가로/세로 블럭</title>
+<style>
+body { margin:0; overflow:hidden; font-family:sans-serif; background:#222; color:#fff; }
+canvas { display:block; }
+#ui { position: absolute; top: 10px; left: 10px; width: 22%; display: flex; flex-direction: column; align-items: center; padding: 10px; box-sizing: border-box; z-index: 10; }
+#ui button, #ui input { width: 90%; padding: 10px; font-size: 1em; margin: 5px 0; border: 2px solid #0f0; background-color: #333; color: #fff; border-radius: 4px; cursor: pointer; box-sizing: border-box; }
+#ui label { display:block; margin:2px 0; color:#fff; width:90%; text-align:left; }
+#rotControls { display:none; flex-direction: column; width: 100%; align-items: center; }
+#blockCountUI { position: absolute; top: 10px; right: 10px; color:#fff; font-size: 1.2em; z-index:10;}
+#coordDisplay { position: absolute; bottom: 10px; left: 10px; color: #0f0; font-size: 1.2em; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="ui">
+    <button id="spawnHorBtn">가로 블럭 가져오기</button>
+    <button id="spawnVerBtn">세로 블럭 가져오기</button>
+    <button id="deleteBtn">선택 블럭/그룹 삭제</button>
+    <button id="undoBtn">이전 단계 되돌리기</button>
+    <button id="saveMemoryBtn">공유 저장</button>
+    <button id="showRotBtn">회전</button>
+    <div id="rotControls">
+        <label>X° <input type="number" id="rotX" step="1"></label>
+        <label>Y° <input type="number" id="rotY" step="1"></label>
+        <label>Z° <input type="number" id="rotZ" step="1"></label>
+        <button id="applyRotBtn">회전 적용</button>
+    </div>
+    <label>정n각형 n: <input type="number" id="polygonN" min="3" value="6"></label>
+    <button id="drawPolygonBtn">정n각형 생성</button>
+</div>
+<div id="blockCountUI">블럭 개수: <span id="blockCount">0</span></div>
+<div id="coordDisplay">좌표: </div>
+
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.149.0/build/three.module.js';
+
+// --- 씬 / 카메라 / 렌더러 ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x333333);
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 1000);
+let radius = 60, theta=Math.PI/4, phi=Math.PI/4;
+const target = new THREE.Vector3(0,0,0);
+function updateCamera(){
+    camera.position.x = radius * Math.sin(phi) * Math.cos(theta);
+    camera.position.y = radius * Math.cos(phi);
+    camera.position.z = radius * Math.sin(phi) * Math.sin(theta);
+    camera.lookAt(target);
+}
+updateCamera();
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(window.innerWidth,window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// --- 라이트 ---
+const light = new THREE.DirectionalLight(0xffffff,1);
+light.position.set(50,80,50);
+scene.add(light);
+
+// --- 바닥 ---
+const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(200,200),
+    new THREE.MeshStandardMaterial({color:0x888888})
+);
+floor.rotation.x=-Math.PI/2;
+scene.add(floor);
+
+// --- 블럭 관리 ---
+let BLOCK_LENGTH=15, BLOCK_WIDTH=3, BLOCK_HEIGHT=1;
+let isHorizontal=true;
+const blocks = [], polygonGroups=[], undoStack=[];
+let previewBlock=null, selectedBlock=null;
+
+function updateBlockCount(){
+    document.getElementById('blockCount').innerText=blocks.length;
+}
+
+function applyZTilt(block){
+    for(const b of blocks){
+        if(b===block) continue;
+        const xOverlap=Math.max(0, Math.min(block.position.x+BLOCK_LENGTH/2,b.position.x+BLOCK_LENGTH/2)-Math.max(block.position.x-BLOCK_LENGTH/2,b.position.x-BLOCK_LENGTH/2));
+        const zOverlap=Math.max(0, Math.min(block.position.z+BLOCK_WIDTH/2,b.position.z+BLOCK_WIDTH/2)-Math.max(block.position.z-BLOCK_WIDTH/2,b.position.z-BLOCK_WIDTH/2));
+        if(xOverlap>0 && zOverlap>0 && Math.abs(block.position.y-b.position.y)<BLOCK_HEIGHT+0.01){
+            const centerDiff = block.position.x-b.position.x;
+            block.rotation.z = Math.abs(centerDiff)<0.2 ? 0 : (centerDiff>0?-4:4)*Math.PI/180;
+            return;
+        }
+    }
+    block.rotation.z=0;
+}
+
+function createBlock(x,y,z,length,height,depth){
+    let finalY=y;
+    for(const b of blocks){
+        if(Math.abs(b.position.x-x)<length && Math.abs(b.position.z-z)<depth)
+            finalY=Math.max(finalY,b.position.y+BLOCK_HEIGHT);
+    }
+    const geometry = new THREE.BoxGeometry(length,height,depth);
+    const material = new THREE.MeshStandardMaterial({color:0xD2A679});
+    const block = new THREE.Mesh(geometry,material);
+    const edgeMat = new THREE.MeshBasicMaterial({color:0x000000, wireframe:true});
+    const edge = new THREE.Mesh(geometry, edgeMat);
+    block.add(edge);
+    block.position.set(x,finalY,z);
+    applyZTilt(block);
+    scene.add(block);
+    blocks.push(block);
+    updateBlockCount();
+    return block;
+}
+
+// --- 선택 강조 ---
+function highlightBlock(block){
+    blocks.forEach(b=>{
+        const edge = b.children.find(c=>c.type==='Mesh' && c.material.wireframe);
+        edge.material.color.set(b===block?0xff0000:0x000000);
+    });
+}
+
+// --- Undo snapshot ---
+function pushUndoSnapshot(){
+    const snapshot = {
+        blocks: blocks.map(b=>({
+            mesh: b,
+            position: b.position.clone(),
+            rotation: b.rotation.clone(),
+            parent: b.userData.parentGroup || null,
+            group: b.userData.group || null
+        })),
+        selectedBlock,
+        previewBlock: previewBlock ? { position: previewBlock.position.clone(), rotation: previewBlock.rotation.clone() } : null
+    };
+    undoStack.push(snapshot);
+}
+
+// --- UI 이벤트 ---
+document.getElementById('spawnHorBtn').addEventListener('click',()=>{
+    pushUndoSnapshot();
+    isHorizontal=true;
+    if(previewBlock) scene.remove(previewBlock);
+    const geo=new THREE.BoxGeometry(15,1,3);
+    const mat=new THREE.MeshStandardMaterial({color:0xD2A679,opacity:0.6,transparent:true});
+    previewBlock=new THREE.Mesh(geo,mat);
+    previewBlock.position.set(0,0.5,0);
+    scene.add(previewBlock);
+});
+document.getElementById('spawnVerBtn').addEventListener('click',()=>{
+    pushUndoSnapshot();
+    isHorizontal=false;
+    if(previewBlock) scene.remove(previewBlock);
+    const geo=new THREE.BoxGeometry(1,15,3);
+    const mat=new THREE.MeshStandardMaterial({color:0xD2A679,opacity:0.6,transparent:true});
+    previewBlock=new THREE.Mesh(geo,mat);
+    previewBlock.position.set(0,7.5,0);
+    scene.add(previewBlock);
+});
+
+// --- 삭제 ---
+document.getElementById('deleteBtn').addEventListener('click',()=>{
+    if(!selectedBlock) return;
+    pushUndoSnapshot();
+    let group=[];
+    if(selectedBlock.userData.parentGroup){
+        group = selectedBlock.userData.parentGroup.children.slice();
+        scene.remove(selectedBlock.userData.parentGroup);
+        const idx = polygonGroups.findIndex(g => g.every(bb => group.includes(bb)));
+        if(idx!==-1) polygonGroups.splice(idx,1);
+    } else {
+        group = selectedBlock.userData.group || [selectedBlock];
+    }
+    group.forEach(b=>{
+        scene.remove(b);
+        const idx=blocks.indexOf(b);
+        if(idx!==-1) blocks.splice(idx,1);
+    });
+    selectedBlock=null;
+    highlightBlock(null);
+    document.getElementById('rotControls').style.display='none';
+    updateBlockCount();
+});
+
+// --- Undo ---
+document.getElementById('undoBtn').addEventListener('click',()=>{
+    if(undoStack.length===0) return;
+    const snapshot = undoStack.pop();
+    blocks.forEach(b=>{
+        if(scene.children.includes(b)) scene.remove(b);
+    });
+    polygonGroups.forEach(g=>{
+        const parent = g[0].userData.parentGroup;
+        if(parent && scene.children.includes(parent)) scene.remove(parent);
+    });
+    blocks.length=0;
+    polygonGroups.length=0;
+    snapshot.blocks.forEach(bSnap=>{
+        const b=bSnap.mesh;
+        b.position.copy(bSnap.position);
+        b.rotation.copy(bSnap.rotation);
+        b.userData.parentGroup=bSnap.parent;
+        b.userData.group=bSnap.group;
+        if(bSnap.parent){
+            if(!scene.children.includes(bSnap.parent)) scene.add(bSnap.parent);
+        } else {
+            scene.add(b);
+        }
+        blocks.push(b);
+        if(bSnap.group && !polygonGroups.includes(bSnap.group)) polygonGroups.push(bSnap.group);
+    });
+    if(previewBlock) scene.remove(previewBlock);
+    if(snapshot.previewBlock){
+        const l = isHorizontal ? 15:1;
+        const h = isHorizontal ? 1:15;
+        const geo=new THREE.BoxGeometry(l,h,3);
+        const mat=new THREE.MeshStandardMaterial({color:0xD2A679,opacity:0.6,transparent:true});
+        previewBlock=new THREE.Mesh(geo,mat);
+        previewBlock.position.copy(snapshot.previewBlock.position);
+        previewBlock.rotation.copy(snapshot.previewBlock.rotation);
+        scene.add(previewBlock);
+    } else previewBlock=null;
+    selectedBlock = snapshot.selectedBlock;
+    highlightBlock(selectedBlock);
+    document.getElementById('rotControls').style.display = selectedBlock ? 'flex':'none';
+    updateBlockCount();
+});
+
+// --- 회전 ---
+document.getElementById('applyRotBtn').addEventListener('click',()=>{
+    if(!selectedBlock) return;
+    pushUndoSnapshot();
+    const x=THREE.MathUtils.degToRad(Number(document.getElementById('rotX').value)||0);
+    const y=THREE.MathUtils.degToRad(Number(document.getElementById('rotY').value)||0);
+    const z=THREE.MathUtils.degToRad(Number(document.getElementById('rotZ').value)||0);
+    if(selectedBlock.userData.parentGroup){
+        selectedBlock.userData.parentGroup.rotation.set(x,y,z);
+    } else {
+        const group = selectedBlock.userData.group || [selectedBlock];
+        group.forEach(b=>b.rotation.set(x,y,z));
+    }
+});
+document.getElementById('showRotBtn').addEventListener('click',()=>{
+    const rc=document.getElementById('rotControls');
+    rc.style.display = rc.style.display==='flex'?'none':'flex';
+});
+
+// --- 정n각형 생성 ---
+document.getElementById('drawPolygonBtn').addEventListener('click',()=>{
+    pushUndoSnapshot();
+    const n=Math.max(3,Number(document.getElementById('polygonN').value)||6);
+    let R = (1/5.8)*n*(isHorizontal?15:1);
+    const groupParent=new THREE.Group();
+    scene.add(groupParent);
+    const group=[];
+    const candidateXZ=[];
+    for(let i=0;i<n;i++){
+        const angle=i*2*Math.PI/n;
+        candidateXZ.push([R*Math.cos(angle), R*Math.sin(angle)]);
+    }
+    let minX=Math.min(...candidateXZ.map(p=>p[0])), maxX=Math.max(...candidateXZ.map(p=>p[0]));
+    let minZ=Math.min(...candidateXZ.map(p=>p[1])), maxZ=Math.max(...candidateXZ.map(p=>p[1]));
+    let baseY=0;
+    for(const g of polygonGroups){
+        const gx=g.map(b=>b.position.x), gz=g.map(b=>b.position.z);
+        const gminX=Math.min(...gx), gmaxX=Math.max(...gx);
+        const gminZ=Math.min(...gz), gmaxZ=Math.max(...gz);
+        const overlapX = !(maxX<gminX || minX>gmaxX);
+        const overlapZ = !(maxZ<gminZ || minZ>gmaxZ);
+        if(overlapX && overlapZ){
+            let gyMax=Math.max(...g.map(b=>b.position.y+(b.geometry.parameters.height||BLOCK_HEIGHT)));
+            baseY=Math.max(baseY, gyMax);
+        }
+    }
+    for(let i=0;i<n;i++){
+        const angle=i*2*Math.PI/n;
+        const x=R*Math.cos(angle), z=R*Math.sin(angle);
+        let y = baseY+(isHorizontal?0.5:7.5);
+        const block=createBlock(x,y,z,isHorizontal?15:1,isHorizontal?1:15,3);
+        block.rotation.y=Math.atan2(-x,-z);
+        groupParent.add(block);
+        block.userData.parentGroup=groupParent;
+        group.push(block);
+        block.userData.group=group;
+    }
+    polygonGroups.push(group);
+});
+
+// --- 공유 저장 (LocalStorage) ---
+document.getElementById('saveMemoryBtn').addEventListener('click',()=>{
+    const data = blocks.map(b=>({
+        position:{x:b.position.x,y:b.position.y,z:b.position.z},
+        rotation:{x:b.rotation.x,y:b.rotation.y,z:b.rotation.z},
+        isHorizontal: b.geometry.parameters.width > b.geometry.parameters.height,
+        groupId: polygonGroups.findIndex(g=>g.includes(b))
+    }));
+    localStorage.setItem('savedBlocks', JSON.stringify(data));
+    alert('저장 완료');
+});
+
+// --- LocalStorage에서 불러오기 ---
+function loadBlocksFromStorage(){
+    const saved = localStorage.getItem('savedBlocks');
+    if(!saved) return;
+    pushUndoSnapshot();
+    const data = JSON.parse(saved);
+    data.forEach(bData=>{
+        const length = bData.isHorizontal ? 15 : 1;
+        const height = bData.isHorizontal ? 1 : 15;
+        const depth = 3;
+        const block = createBlock(bData.position.x,bData.position.y,bData.position.z,length,height,depth);
+        block.rotation.set(bData.rotation.x,bData.rotation.y,bData.rotation.z);
+        if(bData.groupId!==-1){
+            if(!polygonGroups[bData.groupId]) polygonGroups[bData.groupId]=[];
+            polygonGroups[bData.groupId].push(block);
+            block.userData.group = polygonGroups[bData.groupId];
+        }
+    });
+}
+loadBlocksFromStorage();
+
+// --- 좌표 표시 기능 ---
+const coordDisplay = document.getElementById('coordDisplay');
+renderer.domElement.addEventListener('click', e=>{
+    const rect = renderer.domElement.getBoundingClientRect();
+    const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera({x:mouseX, y:mouseY}, camera);
+    const intersects = raycaster.intersectObjects(blocks, true);
+    if(intersects.length>0){
+        const point = intersects[0].point;
+        coordDisplay.innerText = `좌표: X: ${point.x.toFixed(2)}, Y: ${point.y.toFixed(2)}, Z: ${point.z.toFixed(2)}`;
+    }
+});
+
+// --- 마우스/터치/카메라 통합 ---
+let isDragging=false, isCameraDragging=false, prevX=0, prevY=0, touchDistance=0, isTouchCamera=false;
+
+function getTouchDistance(e){
+    const dx=e.touches[0].clientX-e.touches[1].clientX;
+    const dy=e.touches[0].clientY-e.touches[1].clientY;
+    return Math.sqrt(dx*dx+dy*dy);
+}
+function zoom(delta){
+    radius+=delta*0.05;
+    radius=Math.max(10,Math.min(200,radius));
+    updateCamera();
+}
+
+// PC 마우스
+renderer.domElement.addEventListener('mousedown',e=>{
+    prevX=e.clientX; prevY=e.clientY;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera({x:mouseX, y:mouseY}, camera);
+    const intersects=raycaster.intersectObjects(blocks);
+    if(intersects.length>0){
+        selectedBlock=intersects[0].object;
+        highlightBlock(selectedBlock);
+        isDragging=true;
+    } else if(previewBlock) isDragging=true;
+    else isCameraDragging=true;
+});
+renderer.domElement.addEventListener('mouseup',()=>{
+    if(isDragging && previewBlock){
+        pushUndoSnapshot();
+        createBlock(previewBlock.position.x,previewBlock.position.y,previewBlock.position.z, isHorizontal?15:1,isHorizontal?1:15,3);
+        scene.remove(previewBlock);
+        previewBlock=null;
+    }
+    isDragging=false;
+    isCameraDragging=false;
+    updateBlockCount();
+});
+renderer.domElement.addEventListener('mousemove', e=>{
+    handleMove(e.clientX,e.clientY);
+});
+renderer.domElement.addEventListener('wheel', e=>{ zoom(e.deltaY); });
+
+// 터치 이벤트
+renderer.domElement.addEventListener('touchstart', e=>{
+    if(e.touches.length===1){
+        const rect = renderer.domElement.getBoundingClientRect();
+        const mouseX = ((e.touches[0].clientX - rect.left) / rect.width) * 2 - 1;
+        const mouseY = -((e.touches[0].clientY - rect.top) / rect.height) * 2 + 1;
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera({x:mouseX, y:mouseY}, camera);
+        const intersects=raycaster.intersectObjects(blocks);
+        if(intersects.length>0){
+            selectedBlock=intersects[0].object;
+            highlightBlock(selectedBlock);
+            isDragging=true;
+        } else if(previewBlock) isDragging=true;
+        else { isTouchCamera=true; prevX=e.touches[0].clientX; prevY=e.touches[0].clientY; }
+    } else if(e.touches.length===2){
+        isTouchCamera=false;
+        touchDistance=getTouchDistance(e);
+    }
+});
+renderer.domElement.addEventListener('touchmove', e=>{
+    if(e.touches.length===1){
+        handleMove(e.touches[0].clientX,e.touches[0].clientY);
+    } else if(e.touches.length===2){
+        const newDist=getTouchDistance(e);
+        zoom(-(newDist-touchDistance)*2);
+        touchDistance=newDist;
+    }
+});
+
+function handleMove(clientX,clientY){
+    const dx=clientX-prevX, dy=clientY-prevY;
+    prevX=clientX; prevY=clientY;
+    if(isDragging && previewBlock){
+        const rect = renderer.domElement.getBoundingClientRect();
+        const mouseX = ((clientX - rect.left) / rect.width) * 2 - 1;
+        const mouseY = -((clientY - rect.top) / rect.height) * 2 + 1;
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera({x:mouseX, y:mouseY},camera);
+        const intersects=raycaster.intersectObjects(blocks.concat([floor]));
+        if(intersects.length>0){
+            const p=intersects[0].point;
+            previewBlock.position.x=p.x;
+            previewBlock.position.z=p.z;
+            let maxY=(isHorizontal?1:15)/2;
+            for(const b of blocks){
+                if(Math.abs(b.position.x-p.x)<(isHorizontal?15:1) && Math.abs(b.position.z-p.z)<3)
+                    maxY=Math.max(maxY,b.position.y+(isHorizontal?1:15));
+            }
+            previewBlock.position.y=maxY;
+        }
+    } else if(isDragging && selectedBlock){
+        const rect = renderer.domElement.getBoundingClientRect();
+        const mouseX = ((clientX - rect.left) / rect.width) * 2 - 1;
+        const mouseY = -((clientY - rect.top) / rect.height) * 2 + 1;
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera({x:mouseX, y:mouseY},camera);
+        const intersects=raycaster.intersectObject(floor);
+        if(intersects.length>0){
+            const p=intersects[0].point;
+            const group = selectedBlock.userData.parentGroup?selectedBlock.userData.parentGroup.children:selectedBlock.userData.group||[selectedBlock];
+            group.forEach(b=>{
+                let relPos=new THREE.Vector3().subVectors(b.position,selectedBlock.position);
+                if(selectedBlock.userData.parentGroup) relPos.applyEuler(selectedBlock.userData.parentGroup.rotation);
+                const targetX=p.x+relPos.x, targetZ=p.z+relPos.z;
+                let maxY=(b.geometry.parameters.height||BLOCK_HEIGHT)/2;
+                for(const other of blocks){
+                    if(group.includes(other)) continue;
+                    if(Math.abs(other.position.x-targetX)<(other.geometry.parameters.width||BLOCK_LENGTH) && Math.abs(other.position.z-targetZ)<(other.geometry.parameters.depth||BLOCK_WIDTH))
+                        maxY=Math.max(maxY,other.position.y+(other.geometry.parameters.height||BLOCK_HEIGHT));
+                }
+                b.position.set(targetX,maxY,targetZ);
+                applyZTilt(b);
+            });
+        }
+    } else if(isCameraDragging || isTouchCamera){
+        theta+=dx*0.005; phi-=dy*0.005;
+        phi=Math.max(0.1, Math.min(Math.PI-0.1, phi));
+        updateCamera();
+    }
+}
+
+function animate(){ requestAnimationFrame(animate); renderer.render(scene,camera);}
+animate();
+
+window.addEventListener('resize', ()=>{
+    camera.aspect=window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth,window.innerHeight);
+});
+</script>
+</body>
+</html>
